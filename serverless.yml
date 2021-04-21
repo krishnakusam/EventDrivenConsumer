@@ -1,0 +1,187 @@
+
+
+configValidationMode: error
+service: TestEDC
+frameworkVersion: '2'
+
+provider:
+  name: aws
+  runtime: python3.8
+  lambdaHashingVersion: '20201221'
+#  stage: dev
+  environment:
+    SNSTOPIC_ARN:
+      Ref: SNSTopic
+    WORKERQUEUE_URL:
+      Ref: WorkerQueue
+    WORKERDLQ_URL:
+      Ref: WorkerDLQ
+
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+            - sns:Publish
+            - sns:Subscribe
+            - sqs:Subscribe
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+
+          Resource: "*"
+
+
+functions:
+
+  producer:
+    handler: handler.producer
+    events:
+      - http:
+          path: produce
+          method: post
+          cors: true
+
+  consumer:
+    handler: handler.consumer
+    events:
+      - sqs:
+          batchSize: 10
+          arn:
+            Fn::GetAtt:
+              - WorkerQueue
+              - Arn
+
+
+  slackpush:
+    handler: handler.slackit
+    events:
+      - sns:
+          arn: !Ref DlqAlarmSlack
+          topicName: DlqAlarmSlack_2
+          redrivePolicy:
+            deadLetterTargetRef: WorkerDLQ
+
+
+resources:
+  Resources:
+    SNSTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: SNSTopic_
+
+
+    WorkerQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: WorkerQueue_
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - WorkerDLQ
+              - Arn
+          maxReceiveCount: 1
+
+
+    WorkerDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: WorkerDLQ_
+
+
+    DlqAlarmEmail:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: DlqAlarmEmail_
+        Subscription:
+          - Endpoint: krishna.kusam@thebernardgroup.com
+            Protocol: email
+
+
+    DlqAlarmSlack:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: DlqAlarmSlack_2
+
+
+    SNSSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: SNSTopic
+        Endpoint:
+          Fn::GetAtt:
+            - WorkerQueue
+            - Arn
+        Protocol: sqs
+        RawMessageDelivery: 'true'
+        FilterPolicy:
+          event_type:
+            - SHIPMENT_SHIPPED
+            - PRODUCTION_STATUS_CHANGED
+            - ORDER_CREATED
+
+
+    # Create our queue policy for the WorkerSQS
+    WorkerQueueSNSTopicPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Resource: !GetAtt
+                - WorkerQueue
+                - Arn
+              Action: "SQS:SendMessage"
+              Condition:
+                ArnEquals:
+                  "aws:SourceArn": !Ref SNSTopic
+        Queues:
+          - Ref: WorkerQueue
+
+
+    EmailAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: DLQ-Alarm-Email
+        AlarmDescription: 'There are failed messages in the WorkerDLQ.'
+        Namespace: AWS/SQS
+#        MetricName: ApproximateNumberOfMessagesVisible
+        MetricName: NumberOfMessagesReceived
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt WorkerDLQ.QueueName
+        Statistic: Sum
+        Period: 60 # value in secs
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanThreshold
+        AlarmActions:
+          - !Ref DlqAlarmEmail
+
+
+    SlackAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: DLQ-Alarm-Slack
+        AlarmDescription: 'There are failed messages in the WorkerDLQ.'
+        Namespace: AWS/SQS
+#        MetricName: ApproximateNumberOfMessagesVisible
+        MetricName: NumberOfMessagesReceived
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt WorkerDLQ.QueueName
+        Statistic: Sum
+        Period: 60 # value in secs
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanThreshold
+        AlarmActions:
+          - !Ref DlqAlarmSlack
+
+
+plugins:
+  - serverless-python-requirements
